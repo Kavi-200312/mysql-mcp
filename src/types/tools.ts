@@ -44,7 +44,8 @@ export const WriteQuerySchema = z.object({
   sql: z.string().min(1, "SQL statement cannot be empty"),
   params: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
   database: z.string().optional(),
-  userConfirmed: z.boolean().optional().default(false)
+  userConfirmed: z.boolean().optional().default(false),
+  confirmBulk: z.boolean().optional().default(false)
 });
 
 export const ExecuteApprovedWriteSchema = z.object({

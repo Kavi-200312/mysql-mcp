@@ -2,32 +2,37 @@ import pino from "pino";
 
 // CRITICAL for stdio MCP: stdout is exclusively reserved for JSON-RPC messages.
 // All application and audit logs MUST be directed to stderr or a dedicated stream.
-export const auditLogger = pino({
-  level: process.env["LOG_LEVEL"] || "info",
-  timestamp: pino.stdTimeFunctions.isoTime,
-  formatters: {
-    level(label) {
-      return { level: label };
+export const auditLogger = pino(
+  {
+    level: process.env["LOG_LEVEL"] || "info",
+    timestamp: pino.stdTimeFunctions.isoTime,
+    formatters: {
+      level(label) {
+        return { level: label };
+      }
+    },
+    redact: {
+      paths: [
+        "password",
+        "*.password",
+        "secret",
+        "*.secret",
+        "token",
+        "*.token",
+        "approvalToken",
+        "*.approvalToken",
+        "key",
+        "*.key",
+        "privateKey",
+        "*.privateKey",
+        "credentials",
+        "*.credentials"
+      ],
+      censor: "[REDACTED]"
     }
   },
-  redact: {
-    paths: [
-      "password",
-      "*.password",
-      "secret",
-      "*.secret",
-      "token",
-      "*.token",
-      "key",
-      "*.key",
-      "privateKey",
-      "*.privateKey",
-      "credentials",
-      "*.credentials"
-    ],
-    censor: "[REDACTED]"
-  }
-}, process.stderr);
+  process.stderr
+);
 
 export interface AuditEvent {
   requestId: string;
@@ -44,35 +49,48 @@ export interface AuditEvent {
   error?: string;
 }
 
-export function redactSensitiveParams(params?: unknown[]): unknown[] {
-  if (!params || !Array.isArray(params)) {
-    return [];
+/**
+ * Deep recursive parameter and PII sanitizer.
+ */
+export function redactSensitiveParams(param: unknown): unknown {
+  if (param === null || param === undefined) return param;
+
+  if (Array.isArray(param)) {
+    return param.map(item => redactSensitiveParams(item));
   }
 
-  return params.map(param => {
-    if (param === null || param === undefined) return param;
-    if (typeof param === "object") {
-      const copy: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(param as Record<string, unknown>)) {
-        if (/password|secret|token|key|credit|auth|hash/i.test(k)) {
-          copy[k] = "[REDACTED]";
-        } else {
-          copy[k] = v;
-        }
+  if (typeof param === "object") {
+    const copy: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(param as Record<string, unknown>)) {
+      if (/password|secret|token|key|credit|auth|hash|pin|cvv|ssn|authorization/i.test(k)) {
+        copy[k] = "[REDACTED]";
+      } else {
+        copy[k] = redactSensitiveParams(v);
       }
-      return copy;
     }
-    if (typeof param === "string" && param.length > 256) {
+    return copy;
+  }
+
+  if (typeof param === "string") {
+    if (param.length > 256) {
       return `${param.substring(0, 32)}...[TRUNCATED ${param.length} chars]`;
     }
-    return param;
-  });
+    // Redact tokens in raw strings
+    if (/^appr_[a-f0-9]{40,}$/i.test(param) || /^Bearer\s+/i.test(param)) {
+      return "[REDACTED]";
+    }
+  }
+
+  return param;
 }
 
 export function logAuditEvent(event: AuditEvent): void {
   const safeEvent = {
     ...event,
-    params: redactSensitiveParams(event.params)
+    approvalToken: event.approvalToken ? "[REDACTED]" : undefined,
+    params: Array.isArray(event.params)
+      ? (redactSensitiveParams(event.params) as unknown[])
+      : []
   };
 
   if (event.success) {

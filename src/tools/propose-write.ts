@@ -1,3 +1,4 @@
+import nodeSqlParser from "node-sql-parser";
 import { MysqlClientManager } from "../connection/mysql-client.js";
 import { EnvConfig } from "../config/env.js";
 import { validateWriteQuery, SecurityPolicyOptions } from "../security/sql-validator.js";
@@ -5,6 +6,9 @@ import { ApprovalManager } from "../security/approval-manager.js";
 import { ApprovalRequest, WriteOperationType } from "../types/approval.js";
 import { logAuditEvent, auditLogger } from "../audit/logger.js";
 import crypto from "crypto";
+
+const { Parser } = nodeSqlParser;
+const mysqlParser = new Parser();
 
 export interface ProposeWriteResult {
   approvalToken: string;
@@ -57,37 +61,58 @@ export class ProposeWriteTool {
 
     // 1. AST-based validation with configurable policy
     const validated = validateWriteQuery(sql, this.config.DB_NAME, this.getPolicyOptions());
-    const { operation, table, isAutoApproved } = validated;
+    const { operation, table, isAutoApproved, statement } = validated;
 
     let expectedAffectedRows = 1;
     let currentValuesPreview: Record<string, unknown>[] | undefined = undefined;
 
-    // 2. For UPDATE and DELETE, inspect affected rows and preview current state
-    if (operation === "UPDATE" || operation === "DELETE") {
+    // 2. For UPDATE and DELETE, construct count and preview using AST
+    if ((operation === "UPDATE" || operation === "DELETE") && statement.ast["where"]) {
       try {
-        const match = sql.match(/\s+WHERE\s+(.*)$/i);
-        const whereClause = match ? match[1]?.replace(/;\s*$/, "") : "";
+        const countAst = {
+          type: "select",
+          columns: [
+            {
+              expr: {
+                type: "aggr_func",
+                name: "COUNT",
+                args: { expr: { type: "star", value: "*" } }
+              },
+              as: "count"
+            }
+          ],
+          from: statement.ast["table"] || [{ db: null, table }],
+          where: statement.ast["where"]
+        };
 
-        if (whereClause) {
-          const countSql = `SELECT COUNT(*) as count FROM \`${targetDb}\`.\`${table}\` WHERE ${whereClause}`;
-          const countRes = await this.client.executeReadQuery<{ count: number }>(countSql, params);
-          expectedAffectedRows = countRes.rows[0]?.count ?? 0;
+        const previewAst = {
+          type: "select",
+          columns: [{ expr: { type: "star", value: "*" }, as: null }],
+          from: statement.ast["table"] || [{ db: null, table }],
+          where: statement.ast["where"],
+          limit: {
+            seperator: "",
+            value: [{ type: "number", value: 5 }]
+          }
+        };
 
-          // Fetch up to 5 rows for preview
-          const previewSql = `SELECT * FROM \`${targetDb}\`.\`${table}\` WHERE ${whereClause} LIMIT 5`;
-          const previewRes = await this.client.executeReadQuery(previewSql, params);
-          currentValuesPreview = previewRes.rows;
-        }
+        const countSql = mysqlParser.sqlify(countAst as any, { database: "MySQL" });
+        const countRes = await this.client.executeReadQuery<{ count: number }>(countSql);
+        expectedAffectedRows = countRes.rows[0]?.count ?? 0;
+
+        const previewSql = mysqlParser.sqlify(previewAst as any, { database: "MySQL" });
+        const previewRes = await this.client.executeReadQuery(previewSql);
+        currentValuesPreview = previewRes.rows;
       } catch (err: unknown) {
-        auditLogger.warn({ err: err instanceof Error ? err.message : String(err) }, "Failed to generate preview for write statement");
+        auditLogger.warn({ err: err instanceof Error ? err.message : String(err) }, "Failed to generate AST preview for write statement");
       }
     }
 
     const isBulk = expectedAffectedRows > this.config.BULK_AFFECTED_ROW_THRESHOLD;
-    let bulkWarning: string | undefined = undefined;
-
     if (isBulk && !confirmBulk) {
-      bulkWarning = `CAUTION: This ${operation} is estimated to affect ${expectedAffectedRows} rows (bulk threshold is ${this.config.BULK_AFFECTED_ROW_THRESHOLD}). Set confirmBulk: true if intentional.`;
+      throw new Error(
+        `Bulk modification safety block: Estimated ${expectedAffectedRows} affected rows exceeds threshold of ${this.config.BULK_AFFECTED_ROW_THRESHOLD}. Explicit confirmation (confirmBulk: true) is required to issue approval token.`
+      );
     }
 
     // 3. Create cryptographically bound approval token
@@ -125,7 +150,6 @@ export class ProposeWriteTool {
       operation,
       expectedAffectedRows,
       isBulk,
-      ...(bulkWarning ? { bulkWarning } : {}),
       currentValuesPreview,
       expiresAt: new Date(approval.expiresAt).toISOString(),
       isAutoApproved,

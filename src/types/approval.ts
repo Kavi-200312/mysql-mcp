@@ -2,10 +2,12 @@ export type WriteOperationType =
   | "INSERT"
   | "UPDATE"
   | "DELETE"
+  | "REPLACE"
   | "CREATE"
   | "ALTER"
   | "DROP"
-  | "TRUNCATE";
+  | "TRUNCATE"
+  | "RENAME";
 
 export type ApprovalStatus = "PENDING" | "EXECUTED" | "EXPIRED" | "CANCELLED";
 

@@ -57,20 +57,24 @@ SSH Tunnel / Cloud Database (DigitalOcean, AWS RDS, GCP Cloud SQL, Self-hosted V
 
 ## 📦 Quick Installation
 
-### Option 1: Run with `npx` (No installation needed)
+### Option 1: Run with `npx` via GitHub (Zero manual build needed)
+
+Thanks to the automated `prepare` build lifecycle, you can run directly from GitHub without cloning:
 
 ```bash
-npx mysql-mcp
+npx github:Kavi-200312/mysql-mcp
 ```
+
+*(Once published to the public npm registry, `npx mysql-mcp` will also be available).*
 
 ### Option 2: Clone and Build Locally
 
 ```bash
-git clone https://github.com/your-username/mysql-mcp.git
+git clone https://github.com/Kavi-200312/mysql-mcp.git
 cd mysql-mcp
 npm install
-npm run build
 npm test
+npm run build
 ```
 
 ---
@@ -233,9 +237,9 @@ FLUSH PRIVILEGES;
 
 ---
 
-## 🧪 Testing
+## 🧪 Testing & Security Verification
 
-The test suite runs 30 automated security tests using **Vitest**:
+The test suite runs 40 automated security tests using **Vitest**:
 
 ```bash
 npm test
@@ -246,10 +250,23 @@ Verifies:
 -  `DELETE`, `DROP`, `TRUNCATE`, `ALTER`, `CREATE` blocked by default
 -  Configurable policies allow `DELETE` and `DDL` only when explicitly enabled
 -  `UPDATE` and `DELETE` without `WHERE` rejected
--  Session variable injections (`@var`) and `INTO OUTFILE` permanently blocked
+-  Session variable injections (`@var`) and comment-obfuscated `INTO OUTFILE` permanently blocked
+-  Cross-database subqueries, joins, CTEs, and UNIONs strictly prevented
+-  Locking reads (`FOR UPDATE` / `LOCK IN SHARE MODE`) prohibited on read path
 -  Approval tokens reject tampered queries, altered params, and re-executions
--  Row caps, timeouts, and payload limits enforced
--  Sensitive credentials automatically redacted from audit logs
+-  Row caps, server-side `LIMIT` injection, and query cancellation (`KILL QUERY`) enforced
+-  Sensitive credentials and tokens automatically redacted from audit logs
+
+---
+
+## 🛡️ Security Model & Consent Guarantees
+
+> [!IMPORTANT]
+> **Defense-in-Depth Architecture:**
+> The `propose_write` + `execute_approved_write` workflow and the `userConfirmed: true` flag are designed to prevent accidental model hallucinations and catastrophic runaway updates.
+> For mission-critical environments where you defend against adversarial prompt injections, always pair this MCP server with:
+> 1. Dedicated least-privilege MySQL accounts (`ai_agent_reader` / `ai_agent_writer`) created via `scripts/create-db-users.sql`.
+> 2. Native MCP client permission prompts (e.g. Antigravity / Claude Code UI tool confirmation).
 
 ---
 

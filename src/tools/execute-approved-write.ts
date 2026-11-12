@@ -1,5 +1,7 @@
 import { MysqlClientManager } from "../connection/mysql-client.js";
 import { ApprovalManager } from "../security/approval-manager.js";
+import { validateWriteQuery, SecurityPolicyOptions } from "../security/sql-validator.js";
+import { EnvConfig } from "../config/env.js";
 import { logAuditEvent } from "../audit/logger.js";
 import crypto from "crypto";
 
@@ -16,10 +18,25 @@ export interface ExecuteApprovedWriteResult {
 export class ExecuteApprovedWriteTool {
   private client: MysqlClientManager;
   private approvalManager: ApprovalManager;
+  private config: EnvConfig;
 
-  constructor(client: MysqlClientManager, approvalManager: ApprovalManager) {
+  constructor(client: MysqlClientManager, approvalManager: ApprovalManager, config: EnvConfig) {
     this.client = client;
     this.approvalManager = approvalManager;
+    this.config = config;
+  }
+
+  private getPolicyOptions(): SecurityPolicyOptions {
+    return {
+      allowDelete: this.config.POLICY_ALLOW_DELETE,
+      allowDdl: this.config.POLICY_ALLOW_DDL,
+      requireWhere: this.config.POLICY_REQUIRE_WHERE,
+      autoApproveInsert: this.config.POLICY_AUTO_APPROVE_INSERT,
+      autoApproveUpdate: this.config.POLICY_AUTO_APPROVE_UPDATE,
+      autoApproveDelete: this.config.POLICY_AUTO_APPROVE_DELETE,
+      autoApproveDdl: this.config.POLICY_AUTO_APPROVE_DDL,
+      policyMode: this.config.POLICY_MODE
+    };
   }
 
   public async execute(approvalToken: string, userConfirmed: boolean): Promise<ExecuteApprovedWriteResult> {
@@ -30,16 +47,18 @@ export class ExecuteApprovedWriteTool {
     // 1. Validate and consume token (checks expiry, tamper-resistance, single-use)
     const approval = this.approvalManager.validateAndConsume(approvalToken);
 
+    // 2. Security Revalidation: Re-run live policy validation against SQL at execution time
+    validateWriteQuery(approval.sql, approval.database, this.getPolicyOptions());
+
     const requestId = crypto.randomUUID();
     const startTime = Date.now();
 
     try {
-      // 2. Execute within atomic transaction using the dedicated writer pool
+      // 3. Execute within atomic transaction using the dedicated writer pool
       const result = await this.client.executeWriteQuery(approval.sql, approval.params);
-
       const durationMs = Date.now() - startTime;
 
-      // 3. Record execution result
+      // 4. Record execution result
       this.approvalManager.recordExecution({
         token: approval.token,
         sql: approval.sql,
@@ -77,6 +96,9 @@ export class ExecuteApprovedWriteTool {
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const durationMs = Date.now() - startTime;
+
+      // On transient failure, release execution lock so operation can be retried safely
+      this.approvalManager.releaseExecutionLock(approvalToken);
 
       this.approvalManager.recordExecution({
         token: approval.token,

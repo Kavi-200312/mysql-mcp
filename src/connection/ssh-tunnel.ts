@@ -1,5 +1,7 @@
 import { spawn, ChildProcess } from "child_process";
 import net from "net";
+import path from "path";
+import os from "os";
 import { auditLogger } from "../audit/logger.js";
 
 export interface SshTunnelOptions {
@@ -28,24 +30,28 @@ export class SshTunnelManager {
 
   /**
    * Starts or verifies the SSH tunnel and waits until the local port accepts connections.
+   * Fails closed if SSH is enabled but improperly configured or unreachable.
    */
   public async ensureTunnel(): Promise<void> {
     if (!this.options.enabled) {
-      auditLogger.info("SSH tunnel disabled in configuration. Connecting directly to local port.");
+      auditLogger.info("SSH tunnel disabled in configuration. Connecting directly to database host.");
       return;
     }
 
     const { localPort } = this.options;
 
-    // Check if the local port is already reachable (e.g. existing active tunnel)
-    const isAlreadyOpen = await this.checkPortOpen("127.0.0.1", localPort);
-    if (isAlreadyOpen) {
-      auditLogger.info(`Local port 127.0.0.1:${localPort} is already active and listening. Reusing existing tunnel.`);
-      return;
+    // Fail closed if host or user is missing
+    if (!this.options.sshHost || !this.options.sshUser) {
+      throw new Error(
+        "SSH tunnel is enabled but SSH_HOST or SSH_USER is missing. Refusing to connect directly to prevent unencrypted transmission."
+      );
     }
 
-    if (!this.options.sshHost || !this.options.sshUser) {
-      throw new Error("SSH tunnel is enabled but SSH_HOST or SSH_USER is not configured in .env");
+    // Check if the local port is already reachable
+    const isAlreadyOpen = await this.checkPortOpen("127.0.0.1", localPort);
+    if (isAlreadyOpen) {
+      auditLogger.info(`Local port 127.0.0.1:${localPort} is already active. Reusing existing tunnel.`);
+      return;
     }
 
     auditLogger.info(
@@ -67,13 +73,23 @@ export class SshTunnelManager {
       "-o",
       "ExitOnForwardFailure=yes",
       "-o",
+      "BatchMode=yes", // Prevent interactive password prompt hang
+      "-o",
+      "ConnectTimeout=10",
+      "-o",
+      "StrictHostKeyChecking=accept-new",
+      "-o",
       "ServerAliveInterval=30",
       "-o",
       "ServerAliveCountMax=3"
     ];
 
     if (this.options.sshKeyPath && this.options.sshKeyPath.trim().length > 0) {
-      sshArgs.push("-i", this.options.sshKeyPath.trim());
+      let resolvedKey = this.options.sshKeyPath.trim();
+      if (resolvedKey.startsWith("~")) {
+        resolvedKey = path.join(os.homedir(), resolvedKey.slice(1));
+      }
+      sshArgs.push("-i", resolvedKey);
     }
 
     sshArgs.push(`${this.options.sshUser}@${this.options.sshHost}`);
@@ -84,6 +100,10 @@ export class SshTunnelManager {
       this.tunnelProcess = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true
+      });
+
+      this.tunnelProcess.on("error", (err: Error) => {
+        auditLogger.error({ err: err.message }, "SSH process spawn error");
       });
 
       this.tunnelProcess.stderr?.on("data", (chunk: Buffer) => {

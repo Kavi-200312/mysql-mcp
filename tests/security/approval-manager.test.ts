@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { ApprovalManager, ApprovalError } from "../../src/security/approval-manager.js";
+import { ApprovalManager } from "../../src/security/approval-manager.js";
 
 describe("Approval Manager & Gate Security Tests", () => {
   const TEST_DB = "talc_dev_db";
 
   it("generates approval token bound to exact SQL, params, DB and operation", () => {
-    const manager = new ApprovalManager(300);
+    // undefined storePath keeps storage completely in-memory during tests
+    const manager = new ApprovalManager(300, undefined);
     const sql = "UPDATE users SET status = ? WHERE id = ?";
     const params = ["active", 42];
 
@@ -19,7 +20,7 @@ describe("Approval Manager & Gate Security Tests", () => {
       isBulk: false
     });
 
-    expect(approval.token).toMatch(/^appr_[a-f0-9]{40}$/);
+    expect(approval.token).toMatch(/^appr_[a-f0-9]{48}$/);
     expect(approval.status).toBe("PENDING");
     expect(approval.expectedAffectedRows).toBe(1);
 
@@ -34,7 +35,7 @@ describe("Approval Manager & Gate Security Tests", () => {
   });
 
   it("rejects approval consumption if SQL is modified after approval", () => {
-    const manager = new ApprovalManager(300);
+    const manager = new ApprovalManager(300, undefined);
     const originalSql = "UPDATE users SET status = 'active' WHERE id = 1";
     const maliciousSql = "UPDATE users SET status = 'admin' WHERE id = 1";
 
@@ -56,7 +57,7 @@ describe("Approval Manager & Gate Security Tests", () => {
   });
 
   it("rejects approval consumption if parameters are modified after approval", () => {
-    const manager = new ApprovalManager(300);
+    const manager = new ApprovalManager(300, undefined);
     const sql = "UPDATE users SET role = ? WHERE id = ?";
 
     const approval = manager.createApproval({
@@ -79,7 +80,7 @@ describe("Approval Manager & Gate Security Tests", () => {
   });
 
   it("rejects approval consumption if target database is changed", () => {
-    const manager = new ApprovalManager(300);
+    const manager = new ApprovalManager(300, undefined);
     const sql = "INSERT INTO logs (event) VALUES ('login')";
 
     const approval = manager.createApproval({
@@ -100,7 +101,7 @@ describe("Approval Manager & Gate Security Tests", () => {
   });
 
   it("rejects expired approval tokens", () => {
-    const manager = new ApprovalManager(-1); // Instantly expired
+    const manager = new ApprovalManager(-1, undefined); // Instantly expired
     const sql = "INSERT INTO audits (action) VALUES ('test')";
 
     const approval = manager.createApproval({
@@ -122,7 +123,7 @@ describe("Approval Manager & Gate Security Tests", () => {
   });
 
   it("rejects re-use of an already consumed approval token", () => {
-    const manager = new ApprovalManager(300);
+    const manager = new ApprovalManager(300, undefined);
     const sql = "INSERT INTO users (name) VALUES ('Charlie')";
 
     const approval = manager.createApproval({

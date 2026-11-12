@@ -14,7 +14,7 @@ async function main(): Promise<void> {
       {
         db: config.DB_NAME,
         host: config.DB_HOST,
-        port: config.DB_PORT,
+        port: config.EFFECTIVE_DB_PORT,
         sshEnabled: config.SSH_ENABLED
       },
       "Initializing Secure MySQL MCP Server..."
@@ -32,15 +32,11 @@ async function main(): Promise<void> {
     });
 
     if (config.SSH_ENABLED) {
-      if (config.SSH_HOST && config.SSH_USER) {
-        await tunnelManager.ensureTunnel();
-      } else {
-        auditLogger.warn("SSH tunnel is enabled but SSH_HOST or SSH_USER is not fully populated in .env. Waiting for manual tunnel or configuration update.");
-      }
+      await tunnelManager.ensureTunnel();
     }
 
     const clientManager = new MysqlClientManager(config);
-    const approvalManager = new ApprovalManager(config.APPROVAL_EXPIRY_SECONDS);
+    const approvalManager = new ApprovalManager(config.APPROVAL_EXPIRY_SECONDS, config.APPROVAL_STORE_PATH);
 
     // Teardown hook
     const shutdown = async (signal: string) => {

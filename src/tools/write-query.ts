@@ -1,9 +1,13 @@
+import nodeSqlParser from "node-sql-parser";
 import { MysqlClientManager } from "../connection/mysql-client.js";
 import { EnvConfig } from "../config/env.js";
 import { validateWriteQuery, SecurityPolicyOptions } from "../security/sql-validator.js";
 import { ApprovalManager } from "../security/approval-manager.js";
-import { logAuditEvent } from "../audit/logger.js";
+import { logAuditEvent, auditLogger } from "../audit/logger.js";
 import crypto from "crypto";
+
+const { Parser } = nodeSqlParser;
+const mysqlParser = new Parser();
 
 export interface WriteQueryResult {
   success: boolean;
@@ -46,7 +50,8 @@ export class WriteQueryTool {
     sql: string,
     params: unknown[] = [],
     database?: string,
-    userConfirmed = false
+    userConfirmed = false,
+    confirmBulk = false
   ): Promise<WriteQueryResult> {
     const targetDb = database || this.config.DB_NAME;
     if (targetDb.toLowerCase() !== this.config.DB_NAME.toLowerCase()) {
@@ -55,7 +60,41 @@ export class WriteQueryTool {
 
     const policy = this.getPolicyOptions();
     const validated = validateWriteQuery(sql, this.config.DB_NAME, policy);
-    const { operation, table, isAutoApproved } = validated;
+    const { operation, table, isAutoApproved, statement } = validated;
+
+    // Estimate affected rows for UPDATE/DELETE
+    let expectedAffectedRows = 1;
+    if ((operation === "UPDATE" || operation === "DELETE") && statement.ast["where"]) {
+      try {
+        const countAst = {
+          type: "select",
+          columns: [
+            {
+              expr: {
+                type: "aggr_func",
+                name: "COUNT",
+                args: { expr: { type: "star", value: "*" } }
+              },
+              as: "count"
+            }
+          ],
+          from: statement.ast["table"] || [{ db: null, table }],
+          where: statement.ast["where"]
+        };
+        const countSql = mysqlParser.sqlify(countAst as any, { database: "MySQL" });
+        const countRes = await this.client.executeReadQuery<{ count: number }>(countSql);
+        expectedAffectedRows = countRes.rows[0]?.count ?? 0;
+      } catch (err: unknown) {
+        auditLogger.warn({ err: err instanceof Error ? err.message : String(err) }, "Failed to estimate count in write_query");
+      }
+    }
+
+    const isBulk = expectedAffectedRows > this.config.BULK_AFFECTED_ROW_THRESHOLD;
+    if (isBulk && !confirmBulk) {
+      throw new Error(
+        `Bulk modification safety block: Estimated ${expectedAffectedRows} affected rows exceeds threshold of ${this.config.BULK_AFFECTED_ROW_THRESHOLD}. Set confirmBulk: true to authorize bulk execution.`
+      );
+    }
 
     // If policy requires approval and user hasn't explicitly confirmed
     if (!isAutoApproved && !userConfirmed) {
@@ -65,8 +104,8 @@ export class WriteQueryTool {
         database: targetDb,
         table,
         operation,
-        expectedAffectedRows: 1,
-        isBulk: false,
+        expectedAffectedRows,
+        isBulk,
         expirySeconds: this.config.APPROVAL_EXPIRY_SECONDS
       });
 

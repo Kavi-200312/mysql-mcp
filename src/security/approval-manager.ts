@@ -1,12 +1,8 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 import { ApprovalRequest, ExecutionRecord, WriteOperationType } from "../types/approval.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const APPROVAL_STORE_PATH = path.resolve(__dirname, "../../.approvals.json");
+import { redactSensitiveParams } from "../audit/logger.js";
 
 export class ApprovalError extends Error {
   constructor(message: string) {
@@ -19,16 +15,23 @@ export class ApprovalManager {
   private approvals: Map<string, ApprovalRequest> = new Map();
   private executions: ExecutionRecord[] = [];
   private readonly defaultExpirySeconds: number;
+  private readonly storePath?: string;
 
-  constructor(defaultExpirySeconds = 300) {
+  constructor(defaultExpirySeconds = 300, storePath?: string) {
     this.defaultExpirySeconds = defaultExpirySeconds;
+    this.storePath = storePath;
     this.loadFromDisk();
   }
 
+  private hashToken(token: string): string {
+    return crypto.createHash("sha256").update(token).digest("hex");
+  }
+
   private loadFromDisk(): void {
+    if (!this.storePath) return;
     try {
-      if (fs.existsSync(APPROVAL_STORE_PATH)) {
-        const raw = fs.readFileSync(APPROVAL_STORE_PATH, "utf-8");
+      if (fs.existsSync(this.storePath)) {
+        const raw = fs.readFileSync(this.storePath, "utf-8");
         const list: ApprovalRequest[] = JSON.parse(raw);
         for (const item of list) {
           if (Date.now() <= item.expiresAt + 60000) {
@@ -37,23 +40,33 @@ export class ApprovalManager {
         }
       }
     } catch {
-      // Ignore disk read errors
+      // Fallback silently to memory
     }
   }
 
   private saveToDisk(): void {
+    if (!this.storePath) return;
     try {
+      const dir = path.dirname(this.storePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
       const active = Array.from(this.approvals.values()).filter(
         a => Date.now() <= a.expiresAt + 60000
       );
-      fs.writeFileSync(APPROVAL_STORE_PATH, JSON.stringify(active, null, 2), "utf-8");
+
+      const tempFile = `${this.storePath}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(tempFile, JSON.stringify(active, null, 2), "utf-8");
+      fs.renameSync(tempFile, this.storePath);
     } catch {
-      // Ignore disk write errors
+      // Fallback silently to memory if disk write fails
     }
   }
 
   /**
    * Generates a unique, short-lived approval token bound to exact SQL, params, DB, and operation.
+   * Stores hashed token internally to prevent exposure.
    */
   public createApproval(params: {
     sql: string;
@@ -64,43 +77,54 @@ export class ApprovalManager {
     operation: WriteOperationType;
     expectedAffectedRows: number;
     currentValuesPreview?: Record<string, unknown>[];
-    proposedChangesPreview?: Record<string, unknown> | Record<string, unknown>[];
     isBulk: boolean;
     expirySeconds?: number;
   }): ApprovalRequest {
     this.loadFromDisk();
-    const token = `appr_${crypto.randomBytes(20).toString("hex")}`;
+    const rawToken = `appr_${crypto.randomBytes(24).toString("hex")}`;
+    const tokenHash = this.hashToken(rawToken);
     const now = Date.now();
     const expiryMs = (params.expirySeconds || this.defaultExpirySeconds) * 1000;
 
-    const request: ApprovalRequest = {
-      token,
+    // Redact any PII/secrets from stored preview and params
+    const safePreview = params.currentValuesPreview
+      ? (redactSensitiveParams(params.currentValuesPreview) as Record<string, unknown>[])
+      : undefined;
+    const safeParams = (redactSensitiveParams(params.params || []) as unknown[]) || [];
+
+    const storedRequest: ApprovalRequest = {
+      token: tokenHash, // Store hashed token
       sql: params.sql.trim(),
       normalizedSql: params.normalizedSql || params.sql.trim(),
-      params: params.params || [],
+      params: safeParams,
       database: params.database,
       table: params.table,
       operation: params.operation,
       expectedAffectedRows: params.expectedAffectedRows,
-      currentValuesPreview: params.currentValuesPreview,
-      proposedChangesPreview: params.proposedChangesPreview,
+      currentValuesPreview: safePreview,
       isBulk: params.isBulk,
       createdAt: now,
       expiresAt: now + expiryMs,
       status: "PENDING"
     };
 
-    this.approvals.set(token, request);
+    this.approvals.set(tokenHash, storedRequest);
     this.saveToDisk();
-    return request;
+
+    // Return request with the unhashed rawToken to the caller so they can use it as bearer token
+    return {
+      ...storedRequest,
+      token: rawToken
+    };
   }
 
   /**
-   * Retrieves an approval request by token.
+   * Retrieves an approval request by bearer token.
    */
-  public getApproval(token: string): ApprovalRequest | null {
+  public getApproval(rawToken: string): ApprovalRequest | null {
     this.loadFromDisk();
-    const approval = this.approvals.get(token);
+    const tokenHash = this.hashToken(rawToken);
+    const approval = this.approvals.get(tokenHash);
     if (!approval) return null;
 
     if (Date.now() > approval.expiresAt && approval.status === "PENDING") {
@@ -112,11 +136,11 @@ export class ApprovalManager {
   }
 
   /**
-   * Validates and consumes the approval token for execution.
+   * Validates and marks approval token as consumed.
    * Throws an ApprovalError if expired, modified, mismatched, or already consumed.
    */
   public validateAndConsume(
-    token: string,
+    rawToken: string,
     validation?: {
       sql?: string;
       params?: unknown[];
@@ -124,10 +148,11 @@ export class ApprovalManager {
     }
   ): ApprovalRequest {
     this.loadFromDisk();
-    const approval = this.approvals.get(token);
+    const tokenHash = this.hashToken(rawToken);
+    const approval = this.approvals.get(tokenHash);
 
     if (!approval) {
-      throw new ApprovalError(`Approval token '${token}' not found or invalid`);
+      throw new ApprovalError("Approval token not found or invalid");
     }
 
     if (approval.status === "EXECUTED") {
@@ -153,9 +178,11 @@ export class ApprovalManager {
       throw new ApprovalError(`Database mismatch: Approval is bound to '${approval.database}', not '${validation.database}'`);
     }
 
+    // Check parameters against authorized sanitized parameters
     if (validation?.params) {
+      const sanitizedReq = redactSensitiveParams(validation.params);
       const authParamsJson = JSON.stringify(approval.params);
-      const reqParamsJson = JSON.stringify(validation.params);
+      const reqParamsJson = JSON.stringify(sanitizedReq);
       if (authParamsJson !== reqParamsJson) {
         throw new ApprovalError("Query parameters do not match the parameters authorized for this approval token");
       }
@@ -168,8 +195,17 @@ export class ApprovalManager {
   }
 
   /**
-   * Logs execution record.
+   * Resets a token from EXECUTED back to PENDING if execution failed due to transient network failure.
    */
+  public releaseExecutionLock(rawToken: string): void {
+    const tokenHash = this.hashToken(rawToken);
+    const approval = this.approvals.get(tokenHash);
+    if (approval && approval.status === "EXECUTED") {
+      approval.status = "PENDING";
+      this.saveToDisk();
+    }
+  }
+
   public recordExecution(record: ExecutionRecord): void {
     this.executions.push(record);
   }

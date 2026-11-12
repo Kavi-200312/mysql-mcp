@@ -49,7 +49,7 @@ export function createMcpServer(
   const explainQuery = new ExplainQueryTool(client, config);
   const proposeWrite = new ProposeWriteTool(client, approvalManager, config);
   const writeQuery = new WriteQueryTool(client, approvalManager, config);
-  const executeWrite = new ExecuteApprovedWriteTool(client, approvalManager);
+  const executeWrite = new ExecuteApprovedWriteTool(client, approvalManager, config);
 
   const tools: Tool[] = [
     {
@@ -318,7 +318,8 @@ export function createMcpServer(
             parsed.sql,
             parsed.params,
             parsed.database,
-            parsed.userConfirmed
+            parsed.userConfirmed,
+            parsed.confirmBulk
           );
           return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }] };
         }
